@@ -7,7 +7,8 @@ description = "Minimal L3 tunnel: IP packets in iroh QUIC datagrams"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 iroh = "1"
 tokio = { version = "1", features = ["full"] }
-tun = "0.7"
+tun = { version = "0.7", features = ["async"] }
