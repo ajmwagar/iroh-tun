@@ -61,7 +61,9 @@ if [ "${MTU_TEST:-0}" = 1 ]; then
   echo "$OUT"
   # A timeout here is a failure, not a pass: it means the packet vanished and
   # the fragmentation-needed notice never reached the kernel.
-  if echo "$OUT" | grep -qi "too long\|mtu="; then
+  # macOS says "frag needed and DF set (MTU 1414)"; Linux says "Message too
+  # long, mtu=1200". Either is a refusal; a bare timeout is not.
+  if echo "$OUT" | grep -qiE "frag needed|too long|mtu"; then
     echo "refused cleanly: the ICMP notice reached the kernel"
   else
     echo "FAIL: oversize packet neither arrived nor was refused" >&2
