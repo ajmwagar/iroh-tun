@@ -38,6 +38,10 @@ struct Args {
     /// Service kind a node publishes to join this overlay.
     #[arg(long, default_value = "iroh-tun")]
     service_kind: String,
+    /// Re-read the catalog this often. A node that joins later is invisible
+    /// until the next beat.
+    #[arg(long, default_value_t = 15)]
+    refresh_secs: u64,
     /// Dial this peer on startup instead of waiting to be dialled.
     #[arg(long)]
     connect: Option<String>,
@@ -248,7 +252,11 @@ async fn main() -> Result<()> {
     if routes.is_empty() {
         bail!("no routes: pass --route PREFIX=ID, or --mycelium with a service kind");
     }
-    let routes: std::sync::Arc<Vec<Route>> = std::sync::Arc::new(routes);
+    let learned = routes;
+    let routes: std::sync::Arc<tokio::sync::RwLock<Vec<Route>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(learned));
+    let hints: std::sync::Arc<tokio::sync::RwLock<BTreeMap<EndpointId, Vec<std::net::SocketAddr>>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(hints));
 
     let mut config = tun::Configuration::default();
     config.tun_name(&args.tun).mtu(args.mtu).up();
@@ -292,12 +300,17 @@ async fn main() -> Result<()> {
                         eprintln!("iroh-tun: {peer} sent {} > {max}", packet.len());
                         continue;
                     }
-                    // A peer may only speak for the prefixes it was given.
+                    // A peer may only speak for the prefixes it was given. The
+                    // guard is dropped before the next await so a refresh is
+                    // never blocked by an idle connection.
                     let Some(src) = source(&packet) else { continue };
-                    if !routes
-                        .iter()
-                        .any(|r| r.peer == peer && r.contains(src).is_some())
-                    {
+                    let allowed = {
+                        let table = routes.read().await;
+                        table
+                            .iter()
+                            .any(|r| r.peer == peer && r.contains(src).is_some())
+                    };
+                    if !allowed {
                         eprintln!("iroh-tun: {peer} spoofed {src}");
                         continue;
                     }
@@ -306,6 +319,51 @@ async fn main() -> Result<()> {
             });
         }
     });
+
+    // The beat: re-read the catalog on a fixed period. A failed read keeps the
+    // previous table and says so, rather than silently serving stale routes as
+    // if they were fresh.
+    if let Some(bin) = args.mycelium.clone() {
+        let routes = routes.clone();
+        let hints = hints.clone();
+        let kind = args.service_kind.clone();
+        let period = std::time::Duration::from_secs(args.refresh_secs.max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first read already happened at startup
+            loop {
+                tick.tick().await;
+                let output = match std::process::Command::new(&bin)
+                    .args(["services", "--json"])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => output,
+                    Ok(output) => {
+                        eprintln!(
+                            "iroh-tun: refresh failed ({bin} exited {}), keeping {} routes",
+                            output.status,
+                            routes.read().await.len()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("iroh-tun: refresh failed ({bin}: {error}), keeping last catalog");
+                        continue;
+                    }
+                };
+                match mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &kind) {
+                    Ok((learned, addresses)) => {
+                        *routes.write().await = learned;
+                        *hints.write().await = addresses.into_iter().collect();
+                    }
+                    Err(error) => {
+                        eprintln!("iroh-tun: refresh parse failed ({error}), keeping last catalog");
+                    }
+                }
+            }
+        });
+    }
 
     let mut peers: BTreeMap<EndpointId, iroh::endpoint::Connection> = BTreeMap::new();
     for spec in &args.peers {
@@ -332,19 +390,24 @@ async fn main() -> Result<()> {
         let Some(dst) = destination(packet) else {
             continue;
         };
-        let Some(route) = routes
-            .iter()
-            .filter(|r| r.contains(dst).is_some())
-            .max_by_key(|r| r.len)
-        else {
+        let route = {
+            let table = routes.read().await;
+            table
+                .iter()
+                .filter(|r| r.contains(dst).is_some())
+                .max_by_key(|r| r.len)
+                .cloned()
+        };
+        let Some(route) = route else {
             continue;
         };
+        let hint = hints.read().await.get(&route.peer).cloned();
         let conn = match peers.get(&route.peer) {
             Some(conn) => conn,
             None => {
                 // Prefer a published address hint over an address lookup: the
                 // fleet already knows where its nodes are.
-                let target = match hints.get(&route.peer) {
+                let target = match hint {
                     Some(addrs) if !addrs.is_empty() => iroh::EndpointAddr::from_parts(
                         route.peer,
                         addrs.iter().copied().map(iroh::TransportAddr::Ip),
