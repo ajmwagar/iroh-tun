@@ -1,0 +1,13 @@
+[package]
+name = "iroh-tun"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Minimal L3 tunnel: IP packets in iroh QUIC datagrams"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+iroh = "1"
+tokio = { version = "1", features = ["full"] }
+tun = "0.7"
