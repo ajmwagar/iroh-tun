@@ -354,8 +354,16 @@ async fn main() -> Result<()> {
                 };
                 match mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &kind) {
                     Ok((learned, addresses)) => {
+                        let live: std::collections::BTreeSet<EndpointId> =
+                            learned.iter().map(|route| route.peer).collect();
+                        let mut table = hints.write().await;
+                        // A hint for a peer that no longer owns a prefix is dead
+                        // weight: forgetting it is what makes a departed node
+                        // depart rather than linger as an address nobody routes to.
+                        table.retain(|peer, _| live.contains(peer));
+                        table.extend(addresses);
+                        drop(table);
                         *routes.write().await = learned;
-                        *hints.write().await = addresses.into_iter().collect();
                     }
                     Err(error) => {
                         eprintln!("iroh-tun: refresh parse failed ({error}), keeping last catalog");
@@ -402,6 +410,9 @@ async fn main() -> Result<()> {
             continue;
         };
         let hint = hints.read().await.get(&route.peer).cloned();
+        // A connection that has closed is not a connection: forget it before
+        // dialling again, so the map cannot fill with dead peers.
+        peers.retain(|_, conn| conn.close_reason().is_none());
         let conn = match peers.get(&route.peer) {
             Some(conn) => conn,
             None => {
