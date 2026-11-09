@@ -33,6 +33,21 @@ struct Args {
     /// Dial this peer on startup instead of waiting to be dialled.
     #[arg(long)]
     connect: Option<String>,
+    /// `endpoint-id@ip:port`, repeatable. Dial this peer at a known address
+    /// instead of asking a discovery service where it is.
+    #[arg(long = "peer", value_name = "ID@ADDR")]
+    peers: Vec<String>,
+    /// Bind the iroh endpoint here, so a peer can be handed this address
+    /// before the process starts.
+    #[arg(long, value_name = "IP:PORT")]
+    listen: Option<std::net::SocketAddr>,
+    /// 64 hex chars. A fixed key keeps this node's id across restarts; without
+    /// it every run is a new identity and every peer's route goes stale.
+    #[arg(long, value_name = "HEX")]
+    secret: Option<String>,
+    /// Print the endpoint id this `--secret` produces, then exit.
+    #[arg(long)]
+    print_id: bool,
 }
 
 /// A prefix a peer owns. Longest match wins.
@@ -155,10 +170,40 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+fn parse_secret(hex: &str) -> Result<iroh::SecretKey> {
+    if hex.len() != 64 {
+        bail!("a secret is 64 hex characters, got {}", hex.len());
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .with_context(|| format!("secret byte {index}"))?;
+    }
+    Ok(iroh::SecretKey::from_bytes(&bytes))
+}
+
+fn parse_peer(spec: &str) -> Result<(EndpointId, iroh::EndpointAddr)> {
+    let (id, addr) = spec
+        .split_once('@')
+        .context("peer is ENDPOINT_ID@IP:PORT")?;
+    let id = EndpointId::from_str(id).with_context(|| format!("endpoint id {id}"))?;
+    let addr: std::net::SocketAddr = addr.parse().with_context(|| format!("address {addr}"))?;
+    Ok((
+        id,
+        iroh::EndpointAddr::from_parts(id, [iroh::TransportAddr::Ip(addr)]),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber_init();
     let args = Args::parse();
+    if let Some(hex) = &args.secret {
+        if args.print_id {
+            println!("{}", parse_secret(hex)?.public());
+            return Ok(());
+        }
+    }
     if args.routes.is_empty() {
         bail!("at least one --route PREFIX=ENDPOINT_ID is required");
     }
@@ -174,11 +219,14 @@ async fn main() -> Result<()> {
     let tun =
         tun::create_as_async(&config).with_context(|| format!("open tun device {}", args.tun))?;
     let (mut tun_read, mut tun_write) = tokio::io::split(tun);
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .context("bind iroh endpoint")?;
+    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN.to_vec()]);
+    if let Some(listen) = args.listen {
+        builder = builder.bind_addr(listen).context("bind address")?;
+    }
+    if let Some(hex) = &args.secret {
+        builder = builder.secret_key(parse_secret(hex)?);
+    }
+    let endpoint = builder.bind().await.context("bind iroh endpoint")?;
     println!("iroh-tun: {} on {}", endpoint.id(), args.tun);
 
     // One writer owns the tun; readers hand it finished packets.
@@ -224,6 +272,14 @@ async fn main() -> Result<()> {
     });
 
     let mut peers: BTreeMap<EndpointId, iroh::endpoint::Connection> = BTreeMap::new();
+    for spec in &args.peers {
+        let (peer, addr) = parse_peer(spec)?;
+        let conn = endpoint
+            .connect(addr, ALPN)
+            .await
+            .with_context(|| format!("dial {peer}"))?;
+        peers.insert(peer, conn);
+    }
     if let Some(id) = args.connect.as_deref() {
         let peer = EndpointId::from_str(id).context("connect endpoint id")?;
         let conn = endpoint
