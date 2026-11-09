@@ -56,8 +56,17 @@ if [ "${MTU_TEST:-0}" = 1 ]; then
   # kernel may not fragment, so the only correct behaviour is a clean refusal
   # (ICMP fragmentation-needed), not silence and not a hang.
   echo
-echo "oversize, do-not-fragment (expect a refusal, not silence):"
-  ping -c 2 -t 3 -s 1400 -D "$B_IP" && echo "UNEXPECTED: a 1400-byte payload was accepted" || true
+  echo "oversize, do-not-fragment (expect a refusal, not silence):"
+  OUT=$(ping -c 2 -t 3 -s 1400 -D "$B_IP" 2>&1 || true)
+  echo "$OUT"
+  # A timeout here is a failure, not a pass: it means the packet vanished and
+  # the fragmentation-needed notice never reached the kernel.
+  if echo "$OUT" | grep -qi "too long\|mtu="; then
+    echo "refused cleanly: the ICMP notice reached the kernel"
+  else
+    echo "FAIL: oversize packet neither arrived nor was refused" >&2
+    exit 1
+  fi
 
   echo
 echo "after the refusal, a payload that fits must still work:"

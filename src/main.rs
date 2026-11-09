@@ -153,6 +153,11 @@ fn icmp_frag_needed(original: &[u8], mtu: u16) -> Option<Vec<u8>> {
     out[26..28].copy_from_slice(&mtu.to_be_bytes());
     let quote = original.len().min(28);
     out[28..28 + quote].copy_from_slice(&original[..quote]);
+    // The kernel checks this on every packet it takes off a tun. A wrong (or
+    // missing) header checksum means the notice is discarded without a trace,
+    // which is indistinguishable from the original packet simply vanishing.
+    let header = checksum(&out[..20]);
+    out[10..12].copy_from_slice(&header.to_be_bytes());
     let sum = checksum(&out[20..]);
     out[22..24].copy_from_slice(&sum.to_be_bytes());
     Some(out)
@@ -457,6 +462,11 @@ mod tests {
             checksum(&notice[20..]),
             0,
             "a correct ICMP checksum sums to zero with its field included"
+        );
+        assert_eq!(
+            checksum(&notice[..20]),
+            0,
+            "and the IPv4 header checksum must be right, or the kernel drops it"
         );
 
         assert!(icmp_frag_needed(&[0x60; 100], 1200).is_none(), "v6 is not done yet");
