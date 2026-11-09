@@ -16,6 +16,8 @@ use iroh::{Endpoint, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+mod mycelium;
+
 const ALPN: &[u8] = b"iroh-tun/1";
 
 #[derive(Parser)]
@@ -27,9 +29,15 @@ struct Args {
     /// Interface MTU. Kept below `max_datagram_size()`; 1280 is the IPv6 floor.
     #[arg(long, default_value_t = 1280)]
     mtu: u16,
-    /// `prefix=endpoint-id`, repeatable. A peer may only send for its prefixes.
+    /// `prefix=endpoint-id` handed in by hand. Repeatable.
     #[arg(long = "route", value_name = "PREFIX=ID")]
     routes: Vec<String>,
+    /// Learn routes from `mycelium services --json` instead of flags.
+    #[arg(long, value_name = "BIN")]
+    mycelium: Option<String>,
+    /// Service kind a node publishes to join this overlay.
+    #[arg(long, default_value = "iroh-tun")]
+    service_kind: String,
     /// Dial this peer on startup instead of waiting to be dialled.
     #[arg(long)]
     connect: Option<String>,
@@ -212,12 +220,35 @@ async fn main() -> Result<()> {
     if args.routes.is_empty() {
         bail!("at least one --route PREFIX=ENDPOINT_ID is required");
     }
-    let routes: std::sync::Arc<Vec<Route>> = std::sync::Arc::new(
-        args.routes
-            .iter()
-            .map(|spec| Route::parse(spec))
-            .collect::<Result<_>>()?,
-    );
+    let mut routes: Vec<Route> = args
+        .routes
+        .iter()
+        .map(|spec| Route::parse(spec))
+        .collect::<Result<_>>()?;
+    let mut hints: BTreeMap<EndpointId, Vec<std::net::SocketAddr>> = BTreeMap::new();
+    if let Some(bin) = &args.mycelium {
+        let output = std::process::Command::new(bin)
+            .args(["services", "--json"])
+            .output()
+            .with_context(|| format!("run {bin} services --json"))?;
+        if !output.status.success() {
+            bail!("{bin} services --json failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let (learned, addresses) =
+            mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &args.service_kind)?;
+        eprintln!(
+            "iroh-tun: {} routes from {} (kind {})",
+            learned.len(),
+            bin,
+            args.service_kind
+        );
+        routes.extend(learned);
+        hints.extend(addresses);
+    }
+    if routes.is_empty() {
+        bail!("no routes: pass --route PREFIX=ID, or --mycelium with a service kind");
+    }
+    let routes: std::sync::Arc<Vec<Route>> = std::sync::Arc::new(routes);
 
     let mut config = tun::Configuration::default();
     config.tun_name(&args.tun).mtu(args.mtu).up();
@@ -311,8 +342,17 @@ async fn main() -> Result<()> {
         let conn = match peers.get(&route.peer) {
             Some(conn) => conn,
             None => {
+                // Prefer a published address hint over an address lookup: the
+                // fleet already knows where its nodes are.
+                let target = match hints.get(&route.peer) {
+                    Some(addrs) if !addrs.is_empty() => iroh::EndpointAddr::from_parts(
+                        route.peer,
+                        addrs.iter().copied().map(iroh::TransportAddr::Ip),
+                    ),
+                    _ => iroh::EndpointAddr::new(route.peer),
+                };
                 let conn = endpoint
-                    .connect(route.peer, ALPN)
+                    .connect(target, ALPN)
                     .await
                     .with_context(|| format!("dial {}", route.peer))?;
                 peers.insert(route.peer, conn);
@@ -411,6 +451,26 @@ mod tests {
             host.contains("10.0.0.1".parse().expect("ip")).is_none(),
             "a host route is one address"
         );
+    }
+
+    #[test]
+    fn routes_and_addresses_come_from_the_catalog() {
+        let peer = id();
+        let catalog = format!(
+            r#"{{"observations":[
+                {{"value":{{"kind":"iroh-tun","endpoints":["iroh://{peer}"],
+                  "attributes":{{"endpoint_id":"{peer}","overlay":"10.253.0.9/32",
+                                "addresses":"10.253.0.9:7443"}}}}}},
+                {{"value":{{"kind":"unibus","endpoints":["tcp://10.253.0.6:18890"],
+                  "attributes":{{"endpoint_id":"{peer}","overlay":"10.9.0.0/24"}}}}}}
+            ]}}"#
+        );
+        let (routes, hints) = mycelium::routes_from_json(&catalog, "iroh-tun").expect("catalog");
+        assert_eq!(routes.len(), 1, "only the kind we asked for contributes routes");
+        assert_eq!(routes[0].peer, peer);
+        assert!(routes[0].contains("10.253.0.9".parse().expect("ip")).is_some());
+        assert_eq!(hints.len(), 1, "the address hint travels with the route");
+        assert_eq!(hints[0].1, vec!["10.253.0.9:7443".parse().unwrap()]);
     }
 
     #[test]
