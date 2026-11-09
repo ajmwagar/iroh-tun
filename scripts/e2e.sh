@@ -12,6 +12,10 @@ A_TUN=${A_TUN:-utun210}
 B_TUN=${B_TUN:-utun211}
 A_IP=10.9.0.1
 B_IP=10.9.0.2
+# Above the iroh datagram ceiling (about 1200) on purpose when MTU_TEST=1: that
+# is the only way to make the kernel emit a packet the tunnel must refuse.
+A_MTU=${A_MTU:-1280}
+B_MTU=${B_MTU:-1280}
 A_PORT=37001
 B_PORT=37002
 # Fixed secrets, so an endpoint id is known before the process starts and does
@@ -26,11 +30,11 @@ A_ID=$("$BIN" --tun unused --secret "$A_SECRET" --print-id)
 B_ID=$("$BIN" --tun unused --secret "$B_SECRET" --print-id)
 echo "A $A_ID on $A_IP, B $B_ID on $B_IP"
 
-"$BIN" --tun "$B_TUN" --mtu 1280 --secret "$B_SECRET" \
+"$BIN" --tun "$B_TUN" --mtu "$B_MTU" --secret "$B_SECRET" \
   --listen "127.0.0.1:$B_PORT" --peer "$A_ID@127.0.0.1:$A_PORT" \
   --route "$A_IP/32=$A_ID" > /tmp/iroh-tun-b.log 2>&1 &
 B_PID=$!
-"$BIN" --tun "$A_TUN" --mtu 1280 --secret "$A_SECRET" \
+"$BIN" --tun "$A_TUN" --mtu "$A_MTU" --secret "$A_SECRET" \
   --listen "127.0.0.1:$A_PORT" --peer "$B_ID@127.0.0.1:$B_PORT" \
   --route "$B_IP/32=$B_ID" > /tmp/iroh-tun-a.log 2>&1 &
 A_PID=$!
@@ -46,4 +50,23 @@ route -n add -host "$A_IP" -interface "$B_TUN" >/dev/null 2>&1 || true
 
 echo "pinging $B_IP through the tunnel..."
 ping -c 3 -t 5 "$B_IP" || { echo "FAIL: see /tmp/iroh-tun-a.log and /tmp/iroh-tun-b.log" >&2; exit 1; }
+
+if [ "${MTU_TEST:-0}" = 1 ]; then
+  # A 1400-byte payload is bigger than one datagram can carry. With -D the
+  # kernel may not fragment, so the only correct behaviour is a clean refusal
+  # (ICMP fragmentation-needed), not silence and not a hang.
+  echo
+echo "oversize, do-not-fragment (expect a refusal, not silence):"
+  ping -c 2 -t 3 -s 1400 -D "$B_IP" && echo "UNEXPECTED: a 1400-byte payload was accepted" || true
+
+  echo
+echo "after the refusal, a payload that fits must still work:"
+  ping -c 2 -t 5 -s 900 "$B_IP" || {
+    echo "FAIL: the tunnel did not recover from the oversize test" >&2
+    exit 1
+  }
+  echo
+echo "MTU behaviour OK: oversize refused, normal traffic survives"
+fi
+
 echo "OK"
