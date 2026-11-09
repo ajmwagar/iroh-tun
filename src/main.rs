@@ -328,32 +328,54 @@ async fn main() -> Result<()> {
         let hints = hints.clone();
         let kind = args.service_kind.clone();
         let period = std::time::Duration::from_secs(args.refresh_secs.max(1));
+        // Deterministic stagger: this node always wakes at the same offset into
+        // the beat. Random placement would let two consumers collide and then
+        // stay collided, which is invisible until it is a load problem.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in endpoint.id().to_string().bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        let stagger = period.mul_f64((hash % 1000) as f64 / 1000.0);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(period);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; // the first read already happened at startup
+            tokio::time::sleep(stagger).await;
+            let mut failures: u32 = 0;
             loop {
-                tick.tick().await;
-                let output = match std::process::Command::new(&bin)
+                // Coalesce: one read per period, never a queue. If a read is
+                // slow the next one starts late rather than piling up.
+                let delay = if failures == 0 {
+                    period
+                } else {
+                    // Backoff with jitter on failure: a hub outage must not turn
+                    // every node into a fixed-period retry metronome.
+                    let backoff = period
+                        .saturating_mul(1u32 << failures.min(6))
+                        .min(std::time::Duration::from_secs(300));
+                    let jitter_ms = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| u64::from(d.subsec_millis()))
+                        .unwrap_or(0))
+                        % (backoff.as_millis().max(2) as u64);
+                    backoff + std::time::Duration::from_millis(jitter_ms / 4)
+                };
+                tokio::time::sleep(delay).await;
+                let outcome = std::process::Command::new(&bin)
                     .args(["services", "--json"])
                     .output()
-                {
-                    Ok(output) if output.status.success() => output,
-                    Ok(output) => {
-                        eprintln!(
-                            "iroh-tun: refresh failed ({bin} exited {}), keeping {} routes",
-                            output.status,
-                            routes.read().await.len()
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!("iroh-tun: refresh failed ({bin}: {error}), keeping last catalog");
-                        continue;
-                    }
-                };
-                match mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &kind) {
+                    .map_err(|error| format!("{bin}: {error}"))
+                    .and_then(|output| {
+                        if output.status.success() {
+                            Ok(output)
+                        } else {
+                            Err(format!("{bin} exited {}", output.status))
+                        }
+                    })
+                    .and_then(|output| {
+                        mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &kind)
+                            .map_err(|error| error.to_string())
+                    });
+                match outcome {
                     Ok((learned, addresses)) => {
+                        failures = 0;
                         let live: std::collections::BTreeSet<EndpointId> =
                             learned.iter().map(|route| route.peer).collect();
                         let mut table = hints.write().await;
@@ -366,7 +388,11 @@ async fn main() -> Result<()> {
                         *routes.write().await = learned;
                     }
                     Err(error) => {
-                        eprintln!("iroh-tun: refresh parse failed ({error}), keeping last catalog");
+                        failures = failures.saturating_add(1);
+                        eprintln!(
+                            "iroh-tun: refresh failed ({error}), keeping {} routes, attempt {failures}",
+                            routes.read().await.len()
+                        );
                     }
                 }
             }
