@@ -273,3 +273,136 @@ async fn main() -> Result<()> {
 }
 
 fn tracing_subscriber_init() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Endpoint ids are ed25519 public keys, so a test id has to be a real key
+    /// point; arbitrary 32 bytes are rejected by the parser.
+    fn id() -> EndpointId {
+        iroh::SecretKey::generate().public()
+    }
+
+    #[test]
+    fn a_route_only_answers_for_its_prefix() {
+        let peer = id();
+        let host = Route::parse(&format!("10.253.0.9/32={peer}")).expect("route");
+        assert!(host.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 9))).is_some());
+        assert!(
+            host.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 10))).is_none(),
+            "a /32 is one address"
+        );
+
+        let net = Route::parse(&format!("10.253.0.0/24={peer}")).expect("route");
+        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 200))).is_some());
+        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 1, 1))).is_none());
+        assert!(
+            net.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none(),
+            "a v4 prefix never matches a v6 address"
+        );
+    }
+
+    #[test]
+    fn ipv6_prefixes_match_bitwise() {
+        let peer = id();
+        let net = Route::parse(&format!("fd7a:115c:a1e0::/48={peer}")).expect("route");
+        let inside: IpAddr = "fd7a:115c:a1e0:1001::9".parse().expect("v6");
+        let outside: IpAddr = "fd7a:115c:a1e1::9".parse().expect("v6");
+        assert!(net.contains(inside).is_some());
+        assert!(net.contains(outside).is_none());
+    }
+
+    #[test]
+    fn the_longest_prefix_wins() {
+        let (wide, narrow) = (id(), id());
+        let routes = [
+            Route::parse(&format!("10.0.0.0/8={wide}")).expect("wide"),
+            Route::parse(&format!("10.253.0.0/16={narrow}")).expect("narrow"),
+        ];
+        let pick = |ip: IpAddr| {
+            routes
+                .iter()
+                .filter(|r| r.contains(ip).is_some())
+                .max_by_key(|r| r.len)
+                .map(|r| r.peer)
+        };
+        assert_eq!(pick("10.253.0.9".parse().expect("ip")), Some(narrow));
+        assert_eq!(pick("10.9.0.1".parse().expect("ip")), Some(wide));
+        assert_eq!(pick("192.0.2.1".parse().expect("ip")), None);
+    }
+
+    #[test]
+    fn a_bad_route_is_refused_with_a_reason() {
+        let peer = id();
+        for bad in [
+            format!("10.0.0.0/33={peer}"),
+            format!("fd00::/129={peer}"),
+            "10.0.0.0/8=not-an-endpoint-id".to_string(),
+            "no-equals-sign".to_string(),
+        ] {
+            assert!(Route::parse(&bad).is_err(), "{bad} must be refused");
+        }
+        // A bare address is a host route, not a malformed prefix.
+        let host = Route::parse(&format!("10.0.0.0={peer}")).expect("a bare address is a /32");
+        assert!(host.contains("10.0.0.0".parse().expect("ip")).is_some());
+        assert!(
+            host.contains("10.0.0.1".parse().expect("ip")).is_none(),
+            "a host route is one address"
+        );
+    }
+
+    #[test]
+    fn packets_are_read_and_truncated_input_is_ignored() {
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        v4[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        v4[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        assert_eq!(
+            source(&v4),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        assert_eq!(
+            destination(&v4),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        );
+
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        v6[24..40].copy_from_slice(&"fd7a:115c:a1e0::9".parse::<Ipv6Addr>().expect("v6").octets());
+        assert_eq!(source(&v6), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        assert_eq!(destination(&[0x45, 0, 0]), None, "a short packet is not a packet");
+        assert_eq!(destination(&[]), None);
+        assert_eq!(destination(&[0x90; 40]), None, "version 9 is not IP");
+    }
+
+    #[test]
+    fn an_oversized_packet_produces_a_checksummed_notice() {
+        let mut v4 = vec![0u8; 1500];
+        v4[0] = 0x45;
+        v4[9] = 6; // TCP
+        v4[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        v4[16..20].copy_from_slice(&[10, 0, 0, 2]);
+
+        let notice = icmp_frag_needed(&v4, 1200).expect("a v4 packet yields a notice");
+        assert_eq!(notice[0] >> 4, 4);
+        assert_eq!(notice[9], 1, "ICMP");
+        assert_eq!(notice[20], 3, "destination unreachable");
+        assert_eq!(notice[21], 4, "fragmentation needed");
+        assert_eq!(u16::from_be_bytes([notice[26], notice[27]]), 1200);
+        assert_eq!(
+            &notice[28..56],
+            &v4[..28],
+            "the notice quotes the original header"
+        );
+        assert_eq!(
+            checksum(&notice[20..]),
+            0,
+            "a correct ICMP checksum sums to zero with its field included"
+        );
+
+        assert!(icmp_frag_needed(&[0x60; 100], 1200).is_none(), "v6 is not done yet");
+    }
+}
