@@ -102,3 +102,42 @@ fn kind_matches(observed: &str, wanted: &str) -> bool {
         || observed.strip_prefix(wanted) == Some("/1")
         || observed.starts_with(&format!("{wanted}/"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape `myceliumd` publishes for its own tunnel: two overlay
+    /// prefixes, and attributes the consumer does not read. The daemon cannot
+    /// import this test, so the fixture is the contract.
+    #[test]
+    fn learns_from_the_shape_the_daemon_publishes() {
+        let peer = iroh::SecretKey::generate().public();
+        let document = format!(
+            r#"{{"schema_version":1,"observations":[{{"service_id":"service/neo/iroh-tun","value":{{"kind":"iroh-tun","endpoints":["iroh://{peer}"],"protocols":["quic"],"formats":[],"attributes":{{"node_id":"neo","endpoint_id":"{peer}","overlay":"10.42.0.0/24,192.168.10.0/24","tun":"utun220","mtu":"1280","routes":"1"}}}}}}]}}"#
+        );
+        let (routes, hints) = routes_from_json(&document, "iroh-tun").unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.peer == peer));
+        let v4 = routes
+            .iter()
+            .find(|route| route.addr.is_ipv4())
+            .expect("the IPv4 overlay prefix is a route");
+        assert_eq!(v4.len, 24);
+        assert!(v4.contains("10.42.0.7".parse().unwrap()).is_some());
+        assert!(hints.is_empty(), "no address hints were published");
+    }
+
+    /// A node with no prefix is still a peer: it publishes an identity and
+    /// nothing else. That must not become a route to nowhere.
+    #[test]
+    fn an_identity_without_prefixes_yields_no_routes() {
+        let peer = iroh::SecretKey::generate().public();
+        let document = format!(
+            r#"{{"observations":[{{"value":{{"kind":"iroh-tun","endpoints":["iroh://{peer}"],"attributes":{{"endpoint_id":"{peer}","tun":"utun220"}}}}}}]}}"#
+        );
+        let (routes, hints) = routes_from_json(&document, "iroh-tun").unwrap();
+        assert!(routes.is_empty());
+        assert!(hints.is_empty());
+    }
+}
