@@ -221,8 +221,12 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     }
-    if args.routes.is_empty() {
-        bail!("at least one --route PREFIX=ENDPOINT_ID is required");
+    // A node that learns routes from the catalog needs none handed in by hand.
+    // Requiring one made the first node in a fleet unable to start: it has no
+    // peer to point at, so it never publishes its kind, so no second node ever
+    // has anything to learn and the overlay cannot bootstrap itself.
+    if args.routes.is_empty() && args.mycelium.is_none() {
+        bail!("at least one --route PREFIX=ENDPOINT_ID, or --mycelium to learn them");
     }
     let mut routes: Vec<Route> = args
         .routes
@@ -249,8 +253,15 @@ async fn main() -> Result<()> {
         routes.extend(learned);
         hints.extend(addresses);
     }
+    // Zero routes is a valid starting state for a node that learns from the
+    // catalog. The first node in a fleet has no peer to route to yet, and it
+    // has to run before it can publish the kind that lets a second node learn
+    // it. Refusing here means the overlay can never bootstrap itself.
     if routes.is_empty() {
-        bail!("no routes: pass --route PREFIX=ID, or --mycelium with a service kind");
+        if args.mycelium.is_none() {
+            bail!("no routes: pass --route PREFIX=ID, or --mycelium with a service kind");
+        }
+        eprintln!("iroh-tun: no peers yet; publishing and waiting for the catalog to fill");
     }
     let learned = routes;
     let routes: std::sync::Arc<tokio::sync::RwLock<Vec<Route>>> =
