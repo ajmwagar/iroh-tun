@@ -25,6 +25,16 @@ B_SECRET=$(printf 'b%063d' 0)
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo: tun devices need root" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "build first: cargo build --release" >&2; exit 1; }
+# A tun device belongs to the process that opened it. If one of ours is already
+# there, the previous run was killed without cleaning up, and `ifconfig` below
+# would quietly address a device this run does not own. Fail loudly instead.
+for tun in "$A_TUN" "$B_TUN"; do
+  if ifconfig "$tun" >/dev/null 2>&1; then
+    echo "$tun already exists: a previous run left it behind." >&2
+    echo "clear it with: sudo pkill -f 'iroh-tun --tun ${tun}'" >&2
+    exit 1
+  fi
+done
 
 A_ID=$("$BIN" --tun unused --secret "$A_SECRET" --print-id)
 B_ID=$("$BIN" --tun unused --secret "$B_SECRET" --print-id)
@@ -39,8 +49,14 @@ B_PID=$!
   --route "$B_IP/32=$B_ID" > /tmp/iroh-tun-a.log 2>&1 &
 A_PID=$!
 
-cleanup() { kill "$A_PID" "$B_PID" 2>/dev/null || true; }
-trap cleanup EXIT
+cleanup() {
+  # kill only asks; wait is what makes the exit trap actually hold the tuns
+  # until the processes are gone. Without it a fast exit races the teardown and
+  # the next run finds a device owned by a process nobody can find.
+  kill "$A_PID" "$B_PID" 2>/dev/null || true
+  wait "$A_PID" "$B_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM HUP
 
 sleep 3
 ifconfig "$A_TUN" inet "$A_IP" "$B_IP" up

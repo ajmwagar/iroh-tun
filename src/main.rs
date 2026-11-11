@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 mod mycelium;
+mod status;
 
 const ALPN: &[u8] = b"iroh-tun/1";
 
@@ -57,6 +58,11 @@ struct Args {
     /// it every run is a new identity and every peer's route goes stale.
     #[arg(long, value_name = "HEX")]
     secret: Option<String>,
+    /// Write what this tunnel is doing here, atomically, every beat. The daemon
+    /// that spawns this process reads it and publishes the observation; without
+    /// it the daemon has an identity but no evidence of routing.
+    #[arg(long, value_name = "PATH")]
+    status_file: Option<std::path::PathBuf>,
     /// Print the endpoint id this `--secret` produces, then exit.
     #[arg(long)]
     print_id: bool,
@@ -211,6 +217,29 @@ fn parse_peer(spec: &str) -> Result<(EndpointId, iroh::EndpointAddr)> {
     ))
 }
 
+/// Publish this process's own view of itself.
+///
+/// Absent `--status-file` keeps a hand-run tunnel silent. A configured file that
+/// cannot be written is fatal at startup: the daemon would otherwise publish an
+/// identity with no evidence of routing behind it.
+fn write_status(
+    path: Option<&std::path::Path>,
+    endpoint_id: &str,
+    tun: &str,
+    mtu: u16,
+    routes: &[Route],
+    failures: u32,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    status::write(
+        path,
+        &status::Status::new(endpoint_id.to_owned(), tun, mtu, routes, failures),
+    )
+    .with_context(|| format!("write status {}", path.display()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber_init();
@@ -283,6 +312,17 @@ async fn main() -> Result<()> {
     }
     let endpoint = builder.bind().await.context("bind iroh endpoint")?;
     println!("iroh-tun: {} on {}", endpoint.id(), args.tun);
+    let endpoint_id = endpoint.id().to_string();
+    // Report before serving: a tunnel that binds but cannot describe itself is
+    // invisible to the daemon, and invisible is indistinguishable from down.
+    write_status(
+        args.status_file.as_deref(),
+        &endpoint_id,
+        &args.tun,
+        args.mtu,
+        &routes.read().await,
+        0,
+    )?;
 
     // One writer owns the tun; readers hand it finished packets.
     let (to_tun, mut from_peers) = mpsc::channel::<Vec<u8>>(256);
@@ -339,6 +379,10 @@ async fn main() -> Result<()> {
         let hints = hints.clone();
         let kind = args.service_kind.clone();
         let period = std::time::Duration::from_secs(args.refresh_secs.max(1));
+        let status_file = args.status_file.clone();
+        let tun = args.tun.clone();
+        let mtu = args.mtu;
+        let endpoint_id = endpoint_id.clone();
         // Deterministic stagger: this node always wakes at the same offset into
         // the beat. Random placement would let two consumers collide and then
         // stay collided, which is invisible until it is a load problem.
@@ -396,14 +440,42 @@ async fn main() -> Result<()> {
                         table.retain(|peer, _| live.contains(peer));
                         table.extend(addresses);
                         drop(table);
-                        *routes.write().await = learned;
+                        let table = learned;
+                        *routes.write().await = table.clone();
+                        // Report after the table is replaced, never before: a
+                        // status that describes routes the tunnel has not
+                        // installed is worse than a stale one.
+                        if let Err(error) = write_status(
+                            status_file.as_deref(),
+                            &endpoint_id,
+                            &tun,
+                            mtu,
+                            &table,
+                            failures,
+                        ) {
+                            eprintln!("iroh-tun: status: {error}");
+                        }
                     }
                     Err(error) => {
                         failures = failures.saturating_add(1);
+                        let table = routes.read().await.clone();
                         eprintln!(
                             "iroh-tun: refresh failed ({error}), keeping {} routes, attempt {failures}",
-                            routes.read().await.len()
+                            table.len()
                         );
+                        // The daemon needs to see a failing beat too: a tunnel
+                        // serving a stale table looks identical to a healthy
+                        // one from the outside.
+                        if let Err(error) = write_status(
+                            status_file.as_deref(),
+                            &endpoint_id,
+                            &tun,
+                            mtu,
+                            &table,
+                            failures,
+                        ) {
+                            eprintln!("iroh-tun: status: {error}");
+                        }
                     }
                 }
             }
