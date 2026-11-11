@@ -312,6 +312,10 @@ async fn main() -> Result<()> {
     }
     let endpoint = builder.bind().await.context("bind iroh endpoint")?;
     println!("iroh-tun: {} on {}", endpoint.id(), args.tun);
+    // What we are reachable *as*, before anything tries to dial us. Without this
+    // a failed cross-host dial is indistinguishable from a host that never
+    // published itself, and those need opposite fixes.
+    eprintln!("iroh-tun: reachable at {:?}", endpoint.addr());
     let endpoint_id = endpoint.id().to_string();
     // Report before serving: a tunnel that binds but cannot describe itself is
     // invisible to the daemon, and invisible is indistinguishable from down.
@@ -337,14 +341,26 @@ async fn main() -> Result<()> {
     let endpoint_for_accept = endpoint.clone();
     let writer = to_tun.clone();
     let routes_for_accept = routes.clone();
+    // The connections, shared. An accepted connection is a working path to that
+    // peer and must be offered to the send side; keeping only outbound dials here
+    // meant a reply re-dialled a peer that had just reached us, which works on
+    // loopback (every dial succeeds) and fails exactly the one time it matters —
+    // across two hosts behind NAT, where only one direction can dial.
+    let peers: std::sync::Arc<tokio::sync::Mutex<BTreeMap<EndpointId, iroh::endpoint::Connection>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let peers_for_accept = peers.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint_for_accept.accept().await {
             let to_tun = writer.clone();
             let routes = routes_for_accept.clone();
+            let peers = peers_for_accept.clone();
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_id();
+                eprintln!("iroh-tun: peer {peer} connected (inbound)");
+                peers.lock().await.insert(peer, conn.clone());
                 let max = conn.max_datagram_size().unwrap_or(1200);
+                let mut dropped_spoofed = 0u32;
                 while let Ok(packet) = conn.read_datagram().await {
                     let packet = packet.to_vec();
                     if packet.len() > max {
@@ -362,11 +378,21 @@ async fn main() -> Result<()> {
                             .any(|r| r.peer == peer && r.contains(src).is_some())
                     };
                     if !allowed {
-                        eprintln!("iroh-tun: {peer} spoofed {src}");
+                        // Once per peer: a misconfigured route table otherwise
+                        // prints a line per packet and hides everything else.
+                        dropped_spoofed += 1;
+                        if dropped_spoofed == 1 {
+                            eprintln!("iroh-tun: {peer} spoofed {src}; dropping");
+                        }
                         continue;
                     }
-                    let _ = to_tun.send(packet).await;
+                    if to_tun.send(packet).await.is_err() {
+                        break;
+                    }
                 }
+                eprintln!(
+                    "iroh-tun: peer {peer} disconnected (dropped {dropped_spoofed} unauthorized)"
+                );
             });
         }
     });
@@ -482,14 +508,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut peers: BTreeMap<EndpointId, iroh::endpoint::Connection> = BTreeMap::new();
     for spec in &args.peers {
         let (peer, addr) = parse_peer(spec)?;
         let conn = endpoint
             .connect(addr, ALPN)
             .await
             .with_context(|| format!("dial {peer}"))?;
-        peers.insert(peer, conn);
+        eprintln!("iroh-tun: dialed {peer} at a given address");
+        peers.lock().await.insert(peer, conn);
     }
     if let Some(id) = args.connect.as_deref() {
         let peer = EndpointId::from_str(id).context("connect endpoint id")?;
@@ -497,14 +523,21 @@ async fn main() -> Result<()> {
             .connect(peer, ALPN)
             .await
             .with_context(|| format!("dial {peer}"))?;
-        peers.insert(peer, conn);
+        eprintln!("iroh-tun: dialed {peer}");
+        peers.lock().await.insert(peer, conn);
     }
 
     let mut buffer = vec![0u8; args.mtu as usize];
+    // A destination with no route is a configuration answer, not noise: say it
+    // once per address rather than once per packet.
+    let mut unrouteable: std::collections::BTreeSet<IpAddr> = std::collections::BTreeSet::new();
     loop {
         let n = tun_read.read(&mut buffer).await.context("read tun")?;
         let packet = &buffer[..n];
         let Some(dst) = destination(packet) else {
+            if unrouteable.insert(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+                eprintln!("iroh-tun: {n} byte packet is not IPv4 or IPv6");
+            }
             continue;
         };
         let route = {
@@ -513,33 +546,40 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter(|r| r.contains(dst).is_some())
                 .max_by_key(|r| r.len)
-                .cloned()
+                .copied()
         };
         let Some(route) = route else {
+            if unrouteable.insert(dst) {
+                eprintln!("iroh-tun: no route for {dst}; that packet is dropped");
+            }
             continue;
         };
         let hint = hints.read().await.get(&route.peer).cloned();
-        // A connection that has closed is not a connection: forget it before
-        // dialling again, so the map cannot fill with dead peers.
-        peers.retain(|_, conn| conn.close_reason().is_none());
-        let conn = match peers.get(&route.peer) {
-            Some(conn) => conn,
-            None => {
-                // Prefer a published address hint over an address lookup: the
-                // fleet already knows where its nodes are.
-                let target = match hint {
-                    Some(addrs) if !addrs.is_empty() => iroh::EndpointAddr::from_parts(
-                        route.peer,
-                        addrs.iter().copied().map(iroh::TransportAddr::Ip),
-                    ),
-                    _ => iroh::EndpointAddr::new(route.peer),
-                };
-                let conn = endpoint
-                    .connect(target, ALPN)
-                    .await
-                    .with_context(|| format!("dial {}", route.peer))?;
-                peers.insert(route.peer, conn);
-                peers.get(&route.peer).expect("just inserted")
+        let conn = {
+            let mut map = peers.lock().await;
+            // A connection that has closed is not a connection: forget it before
+            // dialling again, so the map cannot fill with dead peers.
+            map.retain(|_, conn| conn.close_reason().is_none());
+            match map.get(&route.peer) {
+                Some(conn) => conn.clone(),
+                None => {
+                    // Prefer a published address hint over an address lookup: the
+                    // fleet already knows where its nodes are.
+                    let target = match hint {
+                        Some(addrs) if !addrs.is_empty() => iroh::EndpointAddr::from_parts(
+                            route.peer,
+                            addrs.iter().copied().map(iroh::TransportAddr::Ip),
+                        ),
+                        _ => iroh::EndpointAddr::new(route.peer),
+                    };
+                    let conn = endpoint
+                        .connect(target, ALPN)
+                        .await
+                        .with_context(|| format!("dial {} for {dst}", route.peer))?;
+                    eprintln!("iroh-tun: dialed {} for {dst}", route.peer);
+                    map.insert(route.peer, conn.clone());
+                    conn
+                }
             }
         };
         let max = conn.max_datagram_size().unwrap_or(1200);
@@ -550,8 +590,8 @@ async fn main() -> Result<()> {
             continue;
         }
         if let Err(error) = conn.send_datagram(bytes::Bytes::copy_from_slice(packet)) {
-            eprintln!("iroh-tun: send {} bytes: {error}", n);
-            peers.remove(&route.peer);
+            eprintln!("iroh-tun: send {} bytes to {}: {error}", n, route.peer);
+            peers.lock().await.remove(&route.peer);
         }
     }
 }
