@@ -182,7 +182,7 @@ fn add_command(prefix: Prefix, tun: &str) -> Invocation {
     {
         let family = if addr.is_ipv4() { "-4" } else { "-6" };
         Invocation {
-            program: "/sbin/ip",
+            program: "ip",
             args: vec![
                 family.into(),
                 "route".into(),
@@ -224,7 +224,7 @@ fn delete_command(prefix: Prefix, tun: &str) -> Invocation {
     {
         let family = if addr.is_ipv4() { "-4" } else { "-6" };
         Invocation {
-            program: "/sbin/ip",
+            program: "ip",
             args: vec![
                 family.into(),
                 "route".into(),
