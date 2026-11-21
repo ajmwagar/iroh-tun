@@ -16,6 +16,7 @@ use iroh::{Endpoint, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+mod kernel;
 mod mycelium;
 mod status;
 
@@ -71,9 +72,9 @@ struct Args {
 /// A prefix a peer owns. Longest match wins.
 #[derive(Clone, Copy)]
 struct Route {
-    addr: IpAddr,
-    len: u8,
-    peer: EndpointId,
+    pub(crate) addr: IpAddr,
+    pub(crate) len: u8,
+    pub(crate) peer: EndpointId,
 }
 
 impl Route {
@@ -229,13 +230,22 @@ fn write_status(
     mtu: u16,
     routes: &[Route],
     failures: u32,
+    kernel: &kernel::KernelRoutes,
 ) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
     status::write(
         path,
-        &status::Status::new(endpoint_id.to_owned(), tun, mtu, routes, failures),
+        &status::Status::new(
+            endpoint_id.to_owned(),
+            tun,
+            mtu,
+            routes,
+            failures,
+            kernel.installed(),
+            kernel.error().map(str::to_owned),
+        ),
     )
     .with_context(|| format!("write status {}", path.display()))
 }
@@ -269,10 +279,15 @@ async fn main() -> Result<()> {
             .output()
             .with_context(|| format!("run {bin} services --json"))?;
         if !output.status.success() {
-            bail!("{bin} services --json failed: {}", String::from_utf8_lossy(&output.stderr));
+            bail!(
+                "{bin} services --json failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        let (learned, addresses) =
-            mycelium::routes_from_json(&String::from_utf8_lossy(&output.stdout), &args.service_kind)?;
+        let (learned, addresses) = mycelium::routes_from_json(
+            &String::from_utf8_lossy(&output.stdout),
+            &args.service_kind,
+        )?;
         eprintln!(
             "iroh-tun: {} routes from {} (kind {})",
             learned.len(),
@@ -295,8 +310,9 @@ async fn main() -> Result<()> {
     let learned = routes;
     let routes: std::sync::Arc<tokio::sync::RwLock<Vec<Route>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(learned));
-    let hints: std::sync::Arc<tokio::sync::RwLock<BTreeMap<EndpointId, Vec<std::net::SocketAddr>>>> =
-        std::sync::Arc::new(tokio::sync::RwLock::new(hints));
+    let hints: std::sync::Arc<
+        tokio::sync::RwLock<BTreeMap<EndpointId, Vec<std::net::SocketAddr>>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(hints));
 
     let mut config = tun::Configuration::default();
     config.tun_name(&args.tun).mtu(args.mtu).up();
@@ -319,6 +335,24 @@ async fn main() -> Result<()> {
     let endpoint_id = endpoint.id().to_string();
     // Report before serving: a tunnel that binds but cannot describe itself is
     // invisible to the daemon, and invisible is indistinguishable from down.
+    // The local endpoint is not a peer. Keeping its own observation in the
+    // table would install a route that sends this node's traffic to itself and
+    // make the source check reject the first real packet.
+    {
+        let mut table = routes.write().await;
+        table.retain(|route| route.peer != endpoint.id());
+    }
+    hints.write().await.retain(|peer, _| *peer != endpoint.id());
+    let kernel = std::sync::Arc::new(tokio::sync::Mutex::new(kernel::KernelRoutes::new(
+        &args.tun,
+    )));
+    kernel::clear_previous(args.status_file.as_deref(), &args.tun);
+    {
+        let mut table = kernel.lock().await;
+        if let Err(error) = table.reconcile(&routes.read().await) {
+            eprintln!("iroh-tun: kernel routes: {error}");
+        }
+    }
     write_status(
         args.status_file.as_deref(),
         &endpoint_id,
@@ -326,6 +360,7 @@ async fn main() -> Result<()> {
         args.mtu,
         &routes.read().await,
         0,
+        &*kernel.lock().await,
     )?;
 
     // One writer owns the tun; readers hand it finished packets.
@@ -346,8 +381,9 @@ async fn main() -> Result<()> {
     // meant a reply re-dialled a peer that had just reached us, which works on
     // loopback (every dial succeeds) and fails exactly the one time it matters —
     // across two hosts behind NAT, where only one direction can dial.
-    let peers: std::sync::Arc<tokio::sync::Mutex<BTreeMap<EndpointId, iroh::endpoint::Connection>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let peers: std::sync::Arc<
+        tokio::sync::Mutex<BTreeMap<EndpointId, iroh::endpoint::Connection>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
     let peers_for_accept = peers.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint_for_accept.accept().await {
@@ -409,6 +445,7 @@ async fn main() -> Result<()> {
         let tun = args.tun.clone();
         let mtu = args.mtu;
         let endpoint_id = endpoint_id.clone();
+        let kernel = kernel.clone();
         // Deterministic stagger: this node always wakes at the same offset into
         // the beat. Random placement would let two consumers collide and then
         // stay collided, which is invisible until it is a load problem.
@@ -468,9 +505,13 @@ async fn main() -> Result<()> {
                         drop(table);
                         let table = learned;
                         *routes.write().await = table.clone();
-                        // Report after the table is replaced, never before: a
-                        // status that describes routes the tunnel has not
-                        // installed is worse than a stale one.
+                        let mut kernel = kernel.lock().await;
+                        if let Err(error) = kernel.reconcile(&table) {
+                            eprintln!("iroh-tun: kernel routes: {error}");
+                        }
+                        // Report after the table and kernel are replaced, never
+                        // before: a status that describes routes the tunnel has
+                        // not installed is worse than a stale one.
                         if let Err(error) = write_status(
                             status_file.as_deref(),
                             &endpoint_id,
@@ -478,9 +519,11 @@ async fn main() -> Result<()> {
                             mtu,
                             &table,
                             failures,
+                            &kernel,
                         ) {
                             eprintln!("iroh-tun: status: {error}");
                         }
+                        drop(kernel);
                     }
                     Err(error) => {
                         failures = failures.saturating_add(1);
@@ -499,6 +542,7 @@ async fn main() -> Result<()> {
                             mtu,
                             &table,
                             failures,
+                            &*kernel.lock().await,
                         ) {
                             eprintln!("iroh-tun: status: {error}");
                         }
@@ -531,8 +575,19 @@ async fn main() -> Result<()> {
     // A destination with no route is a configuration answer, not noise: say it
     // once per address rather than once per packet.
     let mut unrouteable: std::collections::BTreeSet<IpAddr> = std::collections::BTreeSet::new();
+    let mut shutdown = Box::pin(shutdown_signal());
     loop {
-        let n = tun_read.read(&mut buffer).await.context("read tun")?;
+        let n = tokio::select! {
+            result = tun_read.read(&mut buffer) => result.context("read tun")?,
+            _ = &mut shutdown => {
+                // The kernel route table outlives this process unless it is
+                // cleaned up here. A killed process still leaves routes; the
+                // next start removes them from the status document.
+                eprintln!("iroh-tun: shutting down");
+                kernel.lock().await.clear();
+                break Ok(());
+            }
+        };
         let packet = &buffer[..n];
         let Some(dst) = destination(packet) else {
             if unrouteable.insert(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
@@ -596,6 +651,32 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Wait for the service manager's stop signal. A tunnel that exits on SIGTERM
+/// without removing its routes leaves the host pointing at an interface that no
+/// longer exists.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("iroh-tun: cannot watch SIGTERM: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 fn tracing_subscriber_init() {}
 
 #[cfg(test)]
@@ -612,15 +693,22 @@ mod tests {
     fn a_route_only_answers_for_its_prefix() {
         let peer = id();
         let host = Route::parse(&format!("10.253.0.9/32={peer}")).expect("route");
-        assert!(host.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 9))).is_some());
+        assert!(host
+            .contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 9)))
+            .is_some());
         assert!(
-            host.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 10))).is_none(),
+            host.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 10)))
+                .is_none(),
             "a /32 is one address"
         );
 
         let net = Route::parse(&format!("10.253.0.0/24={peer}")).expect("route");
-        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 200))).is_some());
-        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 253, 1, 1))).is_none());
+        assert!(net
+            .contains(IpAddr::V4(Ipv4Addr::new(10, 253, 0, 200)))
+            .is_some());
+        assert!(net
+            .contains(IpAddr::V4(Ipv4Addr::new(10, 253, 1, 1)))
+            .is_none());
         assert!(
             net.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none(),
             "a v4 prefix never matches a v6 address"
@@ -689,9 +777,15 @@ mod tests {
             ]}}"#
         );
         let (routes, hints) = mycelium::routes_from_json(&catalog, "iroh-tun").expect("catalog");
-        assert_eq!(routes.len(), 1, "only the kind we asked for contributes routes");
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the kind we asked for contributes routes"
+        );
         assert_eq!(routes[0].peer, peer);
-        assert!(routes[0].contains("10.253.0.9".parse().expect("ip")).is_some());
+        assert!(routes[0]
+            .contains("10.253.0.9".parse().expect("ip"))
+            .is_some());
         assert_eq!(hints.len(), 1, "the address hint travels with the route");
         assert_eq!(hints[0].1, vec!["10.253.0.9:7443".parse().unwrap()]);
     }
@@ -702,10 +796,7 @@ mod tests {
         v4[0] = 0x45;
         v4[12..16].copy_from_slice(&[10, 0, 0, 1]);
         v4[16..20].copy_from_slice(&[10, 0, 0, 2]);
-        assert_eq!(
-            source(&v4),
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
-        );
+        assert_eq!(source(&v4), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(
             destination(&v4),
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
@@ -714,10 +805,19 @@ mod tests {
         let mut v6 = vec![0u8; 40];
         v6[0] = 0x60;
         v6[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        v6[24..40].copy_from_slice(&"fd7a:115c:a1e0::9".parse::<Ipv6Addr>().expect("v6").octets());
+        v6[24..40].copy_from_slice(
+            &"fd7a:115c:a1e0::9"
+                .parse::<Ipv6Addr>()
+                .expect("v6")
+                .octets(),
+        );
         assert_eq!(source(&v6), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
 
-        assert_eq!(destination(&[0x45, 0, 0]), None, "a short packet is not a packet");
+        assert_eq!(
+            destination(&[0x45, 0, 0]),
+            None,
+            "a short packet is not a packet"
+        );
         assert_eq!(destination(&[]), None);
         assert_eq!(destination(&[0x90; 40]), None, "version 9 is not IP");
     }
@@ -752,6 +852,9 @@ mod tests {
             "and the IPv4 header checksum must be right, or the kernel drops it"
         );
 
-        assert!(icmp_frag_needed(&[0x60; 100], 1200).is_none(), "v6 is not done yet");
+        assert!(
+            icmp_frag_needed(&[0x60; 100], 1200).is_none(),
+            "v6 is not done yet"
+        );
     }
 }

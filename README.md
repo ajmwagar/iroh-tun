@@ -31,9 +31,14 @@ con.send_datagram(buf[..n].to_vec().into())?;     // 1 packet, 1 datagram
    Check on every inbound packet, not at handshake time, or any peer can spoof
    any overlay address.
 4. **Routes come from discovery.** prefix -> node -> endpoint id, from Mycelium's
-   topology. Adding a node must not mean editing every peer's config.
-5. **Privileges stay in one place.** The tun fd needs root or `CAP_NET_ADMIN`;
-   keep that in a small privileged helper rather than the whole process.
+   topology. Adding a node must not mean editing every peer's config. The
+   learned prefixes are also installed in the host route table (and removed
+   when they leave), because a route the kernel does not have is a packet the
+   tunnel never sees.
+5. **Privileges stay in one place.** the tun fd needs root or `CAP_NET_ADMIN`;
+   keep that in a small privileged helper rather than the whole process. The
+   route table has the same requirement, so route installation lives beside the
+   device, not in a user process.
 
 ## Out of scope
 
@@ -42,5 +47,11 @@ NAT traversal (same), multicast, and anything at L4+.
 
 ## Status
 
-Skeleton. The four calls above are the whole design; the work is MTU handling,
-packet validation, and a route table.
+Usable. The data path, MTU notice, source authorization, learned route table and
+kernel route installation are implemented. A clean shutdown removes the routes
+it added; the next start also removes prefixes recorded in the previous status
+document, so a crash does not accumulate them.
+
+The process still needs the tun device and route table, so it runs as a
+root-owned service in the Mycelium installer. Splitting those privileges into a
+narrow fd-passing helper remains future work.
