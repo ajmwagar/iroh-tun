@@ -29,6 +29,13 @@ pub struct Status {
     /// Consecutive failed catalog reads. Non-zero means the route table below is
     /// the last good one, not the current fleet.
     pub refresh_failures: u32,
+    /// Prefixes this process put in the host route table. A route the kernel
+    /// refused is absent here and in `routes`, which is the difference between
+    /// "learned" and "routed".
+    pub kernel_routes: Vec<String>,
+    /// The first kernel route error from the last reconcile, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_error: Option<String>,
 }
 
 impl Status {
@@ -38,6 +45,8 @@ impl Status {
         mtu: u16,
         routes: &[Route],
         refresh_failures: u32,
+        kernel_routes: Vec<String>,
+        kernel_error: Option<String>,
     ) -> Self {
         Self {
             schema_version: 1,
@@ -53,6 +62,8 @@ impl Status {
                 })
                 .collect(),
             refresh_failures,
+            kernel_routes,
+            kernel_error,
         }
     }
 }
